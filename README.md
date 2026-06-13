@@ -5,6 +5,7 @@ A small local Streamlit app for reviewing Microsoft exam-style multiple-choice q
 ## Features
 
 - Loads every `.md` file from `questions/`, including subdirectories
+- Lets deployed-app visitors upload private, session-only `.md` files
 - Supports one or several correct answers
 - Stores review progress locally in SQLite
 - Uses a simple spaced-repetition schedule
@@ -60,6 +61,16 @@ An explanation shown after answering.
 
 Mark every correct answer with `[x]`. Each question must have a heading, a
 statement, at least one choice, and at least one correct answer.
+
+## Upload questions in a deployed app
+
+Use **Upload your Markdown questions** in the sidebar to select one or more
+`.md` files. While uploads are present, the app reviews those questions instead
+of the built-in library.
+
+Uploaded files and their progress stay in the visitor's Streamlit session. They
+are not written to the repository or shared SQLite database, and they disappear
+when the session ends or the uploaded files are removed.
 
 ## Review schedule
 

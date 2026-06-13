@@ -1,5 +1,7 @@
 """Streamlit MVP for reviewing Markdown multiple-choice questions."""
 
+import hashlib
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
@@ -11,7 +13,8 @@ from db import (
     record_review,
     sync_questions,
 )
-from parser import load_questions
+from parser import load_questions, parse_markdown
+from scheduler import schedule_review
 
 
 QUESTIONS_DIR = Path("questions")
@@ -24,22 +27,104 @@ def refresh_questions() -> int:
 
 
 def reset_review_state() -> None:
-    for key in ("review_queue", "review_index", "submitted", "was_correct"):
+    for key in (
+        "review_queue",
+        "review_index",
+        "review_source",
+        "submitted",
+        "was_correct",
+    ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
         if key.startswith("choice_"):
             del st.session_state[key]
 
 
+def sync_uploaded_files(uploaded_files) -> list[str]:
+    """Parse uploads into session state without saving them on the server."""
+    signature = hashlib.sha256()
+    uploaded_questions = []
+    errors = []
+
+    for index, uploaded_file in enumerate(uploaded_files):
+        content = uploaded_file.getvalue()
+        signature.update(uploaded_file.name.encode("utf-8"))
+        signature.update(content)
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            errors.append(f"{uploaded_file.name}: file must use UTF-8 encoding")
+            continue
+        parsed_questions = parse_markdown(
+            text, source_file=f"upload/{index}-{uploaded_file.name}"
+        )
+        if not parsed_questions:
+            errors.append(f"{uploaded_file.name}: no valid questions found")
+        uploaded_questions.extend(parsed_questions)
+
+    new_signature = signature.hexdigest() if uploaded_files else ""
+    if new_signature != st.session_state.get("upload_signature", ""):
+        reset_review_state()
+        st.session_state.upload_progress = {}
+        st.session_state.upload_signature = new_signature
+        st.session_state.uploaded_questions = uploaded_questions
+
+    return errors
+
+
+def using_uploads() -> bool:
+    return bool(st.session_state.get("uploaded_questions"))
+
+
+def get_active_questions() -> list[dict]:
+    if using_uploads():
+        return st.session_state.uploaded_questions
+    return get_all_questions()
+
+
+def get_active_due_questions() -> list[dict]:
+    if not using_uploads():
+        return get_due_questions()
+
+    progress = st.session_state.get("upload_progress", {})
+    today = date.today().isoformat()
+    return [
+        question
+        for question in st.session_state.uploaded_questions
+        if progress.get(question["id"], {}).get("next_review", today) <= today
+    ]
+
+
 def start_review() -> None:
-    st.session_state.review_queue = get_due_questions()
+    st.session_state.review_queue = get_active_due_questions()
+    st.session_state.review_source = "uploads" if using_uploads() else "library"
     st.session_state.review_index = 0
     st.session_state.submitted = False
     st.session_state.was_correct = False
 
 
+def record_uploaded_review(question_id: str, was_correct: bool, rating: str) -> None:
+    progress = st.session_state.setdefault("upload_progress", {})
+    current = progress.get(question_id, {})
+    next_review, interval_days, ease_score = schedule_review(
+        rating,
+        current.get("interval_days", 0),
+        current.get("ease_score", 2.5),
+    )
+    progress[question_id] = {
+        "times_seen": current.get("times_seen", 0) + 1,
+        "correct_count": current.get("correct_count", 0) + int(was_correct),
+        "next_review": next_review,
+        "interval_days": interval_days,
+        "ease_score": ease_score,
+    }
+
+
 def next_question(rating: str, question: dict) -> None:
-    record_review(question["id"], st.session_state.was_correct, rating)
+    if st.session_state.review_source == "uploads":
+        record_uploaded_review(question["id"], st.session_state.was_correct, rating)
+    else:
+        record_review(question["id"], st.session_state.was_correct, rating)
     for choice_index in range(len(question["choices"])):
         st.session_state.pop(f"choice_{question['id']}_{choice_index}", None)
     st.session_state.review_index += 1
@@ -50,9 +135,11 @@ def next_question(rating: str, question: dict) -> None:
 
 def render_review_page() -> None:
     st.header("Review")
-    due_count = len(get_due_questions())
-    total_count = len(get_all_questions())
+    due_count = len(get_active_due_questions())
+    total_count = len(get_active_questions())
     st.caption(f"{due_count} due today | {total_count} questions available")
+    if using_uploads():
+        st.caption("Using uploaded questions. Progress is private and session-only.")
 
     if "review_queue" not in st.session_state:
         if due_count == 0:
@@ -114,7 +201,7 @@ def render_review_page() -> None:
 
 def render_browse_page() -> None:
     st.header("Browse questions")
-    questions = get_all_questions()
+    questions = get_active_questions()
     st.caption(f"{len(questions)} questions imported")
 
     for question in questions:
@@ -126,8 +213,15 @@ def render_browse_page() -> None:
                 st.write(f"{marker} {choice}")
             if question["explanation"]:
                 st.info(question["explanation"])
-            seen = question["times_seen"] or 0
-            correct = question["correct_count"] or 0
+            if using_uploads():
+                progress = st.session_state.get("upload_progress", {}).get(
+                    question["id"], {}
+                )
+                seen = progress.get("times_seen", 0)
+                correct = progress.get("correct_count", 0)
+            else:
+                seen = question["times_seen"] or 0
+                correct = question["correct_count"] or 0
             st.caption(
                 f"Source: {question['source_file']} | Seen: {seen} | Correct: {correct}"
             )
@@ -139,7 +233,23 @@ imported_count = refresh_questions()
 
 st.title("MCQ Review")
 page = st.sidebar.radio("Navigation", ("Review", "Browse questions"))
-st.sidebar.caption(f"{imported_count} questions loaded from `{QUESTIONS_DIR}/`")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload your Markdown questions",
+    type="md",
+    accept_multiple_files=True,
+    help="Uploads stay private in this browser session and are not saved to SQLite.",
+)
+upload_errors = sync_uploaded_files(uploaded_files)
+for error in upload_errors:
+    st.sidebar.error(error)
+
+if using_uploads():
+    st.sidebar.success(
+        f"Using {len(st.session_state.uploaded_questions)} uploaded questions"
+    )
+    st.sidebar.caption("Remove all uploaded files to return to the built-in library.")
+else:
+    st.sidebar.caption(f"{imported_count} questions loaded from `{QUESTIONS_DIR}/`")
 if st.sidebar.button("Reload Markdown files"):
     reset_review_state()
     refresh_questions()
