@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -13,6 +14,25 @@ from scheduler import schedule_review
 
 
 DB_PATH = Path("data/app.db")
+
+
+def _natural_sort_key(value: str) -> list[int | str]:
+    """Sort numbered titles as Question 2 before Question 10."""
+    return [
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", value)
+    ]
+
+
+def _sort_questions(questions: list[dict], include_due_date: bool = False) -> list[dict]:
+    return sorted(
+        questions,
+        key=lambda question: (
+            question.get("next_review") or "" if include_due_date else "",
+            question["source_file"].casefold(),
+            _natural_sort_key(question["title"]),
+        ),
+    )
 
 
 @contextmanager
@@ -111,7 +131,7 @@ def get_all_questions(db_path: str | Path = DB_PATH) -> list[dict]:
             ORDER BY q.source_file, q.title
             """
         ).fetchall()
-    return [_row_to_question(row) for row in rows]
+    return _sort_questions([_row_to_question(row) for row in rows])
 
 
 def get_due_questions(db_path: str | Path = DB_PATH) -> list[dict]:
@@ -128,7 +148,10 @@ def get_due_questions(db_path: str | Path = DB_PATH) -> list[dict]:
             """,
             (today,),
         ).fetchall()
-    return [_row_to_question(row) for row in rows]
+    return _sort_questions(
+        [_row_to_question(row) for row in rows],
+        include_due_date=True,
+    )
 
 
 def record_review(
